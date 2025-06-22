@@ -1,0 +1,236 @@
+# GKE用Kubernetesマニフェスト
+# FastAPI高トラフィック対応アプリケーション用設定
+
+---
+# ConfigMap: 非機密設定情報
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: async-starter-config
+  labels:
+    app: async-starter
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "info"
+  PORT: "8080"
+  WORKERS: "4"
+  # データベース設定（非機密情報のみ）
+  DB_HOST: "mysql-service"  # Cloud SQL Proxyまたは内部サービス名
+  DB_PORT: "3306"
+  DB_NAME: "async_db"
+
+---
+# Secret: 機密設定情報
+apiVersion: v1
+kind: Secret
+metadata:
+  name: async-starter-secret
+  labels:
+    app: async-starter
+type: Opaque
+data:
+  # Base64エンコードが必要
+  # 例: echo -n "your-password" | base64
+  DB_USER: dGVzdHVzZXI=      # testuser
+  DB_PASSWORD: dGVzdHBhc3M=  # testpass
+
+---
+# Deployment: アプリケーションの実行設定
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: async-starter-deployment
+  labels:
+    app: async-starter
+spec:
+  replicas: 3  # 高可用性のため3つのレプリカ
+  selector:
+    matchLabels:
+      app: async-starter
+  template:
+    metadata:
+      labels:
+        app: async-starter
+      annotations:
+        # プロダクション環境での監視とログ収集用
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # セキュリティコンテキスト
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      
+      containers:
+      - name: async-starter
+        image: gcr.io/YOUR_PROJECT_ID/async-starter:latest  # 実際のプロジェクトIDに置き換え
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        
+        # 環境変数（ConfigMapとSecretから取得）
+        envFrom:
+        - configMapRef:
+            name: async-starter-config
+        - secretRef:
+            name: async-starter-secret
+        
+        # リソース制限
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+        
+        # ヘルスチェック設定
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Graceful shutdown設定
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 15"]
+        
+        # セキュリティコンテキスト
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false  # アプリケーションによる一時ファイル作成を許可
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+
+      # 終了時の猶予期間
+      terminationGracePeriodSeconds: 30
+      
+      # ノード選択（オプション）
+      nodeSelector:
+        cloud.google.com/gke-nodepool: "default-pool"
+
+---
+# Service: 内部ロードバランサー
+apiVersion: v1
+kind: Service
+metadata:
+  name: async-starter-service
+  labels:
+    app: async-starter
+  annotations:
+    # GKE固有のアノテーション
+    cloud.google.com/backend-config: '{"default": "async-starter-backend-config"}'
+spec:
+  selector:
+    app: async-starter
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  type: ClusterIP
+
+---
+# HorizontalPodAutoscaler: オートスケーリング設定
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: async-starter-hpa
+  labels:
+    app: async-starter
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: async-starter-deployment
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 30
+
+---
+# PodDisruptionBudget: 高可用性保証
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: async-starter-pdb
+  labels:
+    app: async-starter
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: async-starter
+
+---
+# BackendConfig: GKE Ingress用バックエンド設定
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: async-starter-backend-config
+  labels:
+    app: async-starter
+spec:
+  # ヘルスチェック設定
+  healthCheck:
+    checkIntervalSec: 30
+    timeoutSec: 10
+    healthyThreshold: 1
+    unhealthyThreshold: 3
+    type: HTTP
+    requestPath: /health
+    port: 8080
+  
+  # セッション親和性（必要に応じて）
+  sessionAffinity:
+    affinityType: "NONE"
+  
+  # タイムアウト設定
+  timeoutSec: 30
+  
+  # 接続分散設定
+  connectionDraining:
+    drainingTimeoutSec: 60

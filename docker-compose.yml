@@ -1,0 +1,138 @@
+# ローカル開発環境用Docker Compose設定
+# 本番環境はGKEを使用し、これは開発・テスト用途
+
+version: '3.8'
+
+services:
+  # FastAPIアプリケーション
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    ports:
+      - "8000:8080"
+    environment:
+      # 開発環境設定
+      ENVIRONMENT: development
+      DEBUG: "true"
+      LOG_LEVEL: debug
+      PORT: 8080
+      WORKERS: 1  # 開発環境では1ワーカーで十分
+      
+      # データベース接続設定
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: testuser
+      DB_PASSWORD: testpass
+      DB_NAME: testdb
+      
+      # データベース接続プール設定（開発環境用）
+      DB_POOL_MIN_SIZE: 2
+      DB_POOL_MAX_SIZE: 5
+      DB_POOL_RECYCLE: 3600
+      DB_POOL_TIMEOUT: 30
+      DB_MAX_OVERFLOW: 5
+    
+    depends_on:
+      mysql:
+        condition: service_healthy
+    
+    volumes:
+      # 開発時のホットリロード用（本番では使用しない）
+      - ./src:/app/src:ro
+      - ./run.py:/app/run.py:ro
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+    
+    # ヘルスチェック
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # MySQL データベース
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpass
+      MYSQL_CHARACTER_SET_SERVER: utf8mb4
+      MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
+    
+    volumes:
+      # 初期化スクリプト
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # データ永続化
+      - mysql_data:/var/lib/mysql
+      # MySQL設定
+      - ./mysql.conf:/etc/mysql/conf.d/mysql.conf:ro
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+    
+    # ヘルスチェック
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    
+    # パフォーマンス設定
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --innodb-buffer-pool-size=128M
+      --innodb-log-file-size=64M
+      --max-connections=200
+      --sql-mode=STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO
+
+  # Redis (キャッシュ用 - オプション)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - app-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+
+# ネットワーク設定
+networks:
+  app-network:
+    driver: bridge
+
+# ボリューム設定
+volumes:
+  mysql_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# 開発用の追加サービス（オプション）
+  # phpMyAdmin (データベース管理用)
+  # phpmyadmin:
+  #   image: phpmyadmin/phpmyadmin
+  #   ports:
+  #     - "8080:80"
+  #   environment:
+  #     PMA_HOST: mysql
+  #     PMA_USER: testuser
+  #     PMA_PASSWORD: testpass
+  #   depends_on:
+  #     - mysql
+  #   networks:
+  #     - app-network
